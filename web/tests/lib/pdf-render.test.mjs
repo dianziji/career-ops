@@ -9,6 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { StringDecoder } from "node:string_decoder";
 import { mkdtempSync, writeFileSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -21,20 +22,36 @@ import {
   renderAndMarkPdf,
 } from "../../src/lib/pdf-render.mjs";
 
-// A fake child_process.spawn() result: stdout/stderr emit "data" once, then
-// the child emits "close" (or "error" instead, for a spawn failure) on the
-// next microtask — close enough to the real async timing for these tests.
-function fakeChild({ stdout = "", stderr = "", exitCode = 0, spawnError = null } = {}) {
+// A fake stdio stream: emits raw Buffers, or decoded strings once the code
+// under test calls setEncoding() — the same contract a real child's stream
+// has, so a chunk boundary inside a multibyte character can be reproduced.
+function fakeStream() {
+  const stream = new EventEmitter();
+  let decoder = null;
+  stream.setEncoding = (enc) => { decoder = new StringDecoder(enc); };
+  stream.push = (buf) => { stream.emit("data", decoder ? decoder.write(buf) : buf); };
+  return stream;
+}
+
+// A fake child_process.spawn() result: stdout/stderr emit "data" (once, or
+// per entry of `stderrChunks`), then the child emits "close" (or "error"
+// instead, for a spawn failure) on the next microtask — close enough to the
+// real async timing for these tests. `writes` is a file the fake "renderer"
+// creates before closing, the way generate-pdf.mjs leaves a PDF at the final
+// path; a route without it stands in for a render that wrote nothing there.
+function fakeChild({ stdout = "", stderr = "", stderrChunks = null, exitCode = 0, spawnError = null, writes = null } = {}) {
   const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
+  child.stdout = fakeStream();
+  child.stderr = fakeStream();
   queueMicrotask(() => {
     if (spawnError) {
       child.emit("error", spawnError);
       return;
     }
-    if (stdout) child.stdout.emit("data", Buffer.from(stdout));
-    if (stderr) child.stderr.emit("data", Buffer.from(stderr));
+    if (stdout) child.stdout.push(Buffer.from(stdout));
+    if (stderrChunks) for (const chunk of stderrChunks) child.stderr.push(chunk);
+    else if (stderr) child.stderr.push(Buffer.from(stderr));
+    if (writes) writeFileSync(writes, "%PDF-fake");
     child.emit("close", exitCode);
   });
   return child;
@@ -242,7 +259,7 @@ test("renderAndMarkPdf: happy path -> rendered with no warnings, scratch cleaned
   const pdfPaths = makePdfPaths(dir, "1");
   writeFileSync(pdfPaths.html, "<html></html>");
   const { spawnFn, calls } = makeRouterSpawn({
-    "generate-pdf.mjs": { exitCode: 0 },
+    "generate-pdf.mjs": { exitCode: 0, writes: pdfPaths.finalPdf },
     "mark-pdf-ready.mjs": { exitCode: 0, stdout: JSON.stringify({ changed: true }) },
   });
   try {
@@ -327,13 +344,96 @@ test("renderAndMarkPdf: generate-pdf.mjs exits 0 over a warn-only page budget ->
   }
 });
 
+test("renderAndMarkPdf: a warn-only overflow over an existing PDF leaves it in place and is still not delivered", async () => {
+  // Given a previous good PDF at the final path, and a render that ran over
+  // the budget: generate-pdf.mjs keeps the previous PDF byte for byte and
+  // writes the draft beside it. The old file still being there must not read
+  // as "this render delivered a PDF".
+  const dir = makeScratchDir();
+  const pdfPaths = makePdfPaths(dir, "8");
+  writeFileSync(pdfPaths.html, "<html></html>");
+  writeFileSync(pdfPaths.finalPdf, "PREVIOUS GOOD PDF");
+  const stderr = [
+    "⚠️  CV is 2 pages; the allowed maximum is 1 page. Trim lower-priority bullets, older roles, secondary projects, or the competencies strip, then regenerate. Overflow is warning-only by default; use --strict-pages to reject it.",
+    `⚠️  Overflow draft: ${pdfPaths.finalPdf.replace(/\.pdf$/, ".overflow.pdf")} (the existing PDF at the output path was left unchanged). Trim and rerun to write ${pdfPaths.finalPdf}.`,
+  ].join("\n");
+  const { spawnFn, calls } = makeRouterSpawn({
+    "generate-pdf.mjs": { exitCode: 0, stderr },
+    "mark-pdf-ready.mjs": { exitCode: 0, stdout: JSON.stringify({ changed: true }) },
+  });
+  try {
+    const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "8" });
+
+    assert.equal(result.kind, "render-failed");
+    assert.match(result.error, /^CV is 2 pages; the allowed maximum is 1 page\. No PDF was written/);
+    assert.ok(result.error.includes("cv-jane-acme-2026-07-26.overflow.pdf"), result.error);
+    assert.equal(calls.length, 1, "mark-pdf-ready.mjs must not run");
+    assert.equal(readFileSync(pdfPaths.finalPdf, "utf8"), "PREVIOUS GOOD PDF", "the previous PDF is untouched");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("renderAndMarkPdf: a stderr chunk boundary inside a multibyte character still yields the overflow error with the draft named intact", async () => {
+  // Given the overflow warning arrives in two chunks, split inside a
+  // multibyte character of the draft's own name (the warnings also open with
+  // the multibyte ⚠️, so any boundary can land this way). Decoding each chunk
+  // on its own would turn the split bytes into U+FFFD and misname the draft;
+  // delivery is decided from the file either way.
+  const dir = makeScratchDir();
+  const pdfPaths = makePdfPaths(dir, "9");
+  writeFileSync(pdfPaths.html, "<html></html>");
+  const draftPath = join(dir, "output", "cv-josé-acme-2026-07-26.overflow.pdf");
+  const text = [
+    "⚠️  CV is 2 pages; the allowed maximum is 1 page. Trim lower-priority bullets, older roles, secondary projects, or the competencies strip, then regenerate. Overflow is warning-only by default; use --strict-pages to reject it.",
+    `⚠️  Overflow draft: ${draftPath} (nothing was written to the output path). Trim and rerun to write ${pdfPaths.finalPdf}.`,
+  ].join("\n");
+  const bytes = Buffer.from(text);
+  const accent = bytes.indexOf(Buffer.from("é"));
+  const cut = accent + 1; // between the two bytes of é
+  assert.ok(accent > 0 && cut < bytes.length);
+  const { spawnFn, calls } = makeRouterSpawn({
+    "generate-pdf.mjs": { exitCode: 0, stderrChunks: [bytes.subarray(0, cut), bytes.subarray(cut)] },
+    "mark-pdf-ready.mjs": { exitCode: 0, stdout: JSON.stringify({ changed: true }) },
+  });
+  try {
+    const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "9" });
+
+    assert.equal(result.kind, "render-failed");
+    assert.ok(result.error.includes("cv-josé-acme-2026-07-26.overflow.pdf"), `draft name broken across the chunk boundary: ${result.error}`);
+    assert.ok(!result.error.includes("�"), "no replacement character in the error");
+    assert.equal(calls.length, 1, "mark-pdf-ready.mjs must not run");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("renderAndMarkPdf: exit 0 with no PDF and nothing on stderr -> render-failed that says so, not a guessed page budget", async () => {
+  const dir = makeScratchDir();
+  const pdfPaths = makePdfPaths(dir, "10");
+  writeFileSync(pdfPaths.html, "<html></html>");
+  const { spawnFn, calls } = makeRouterSpawn({
+    "generate-pdf.mjs": { exitCode: 0, stderr: "" },
+    "mark-pdf-ready.mjs": { exitCode: 0, stdout: JSON.stringify({ changed: true }) },
+  });
+  try {
+    const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "10" });
+
+    assert.equal(result.kind, "render-failed");
+    assert.match(result.error, /reported success but wrote nothing to cv-jane-acme-2026-07-26\.pdf/);
+    assert.equal(calls.length, 1, "mark-pdf-ready.mjs must not run");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("renderAndMarkPdf: render succeeds but mark-pdf-ready fails with a parseable error -> rendered with a specific warning", async () => {
   // Given generate-pdf.mjs succeeds but mark-pdf-ready.mjs fails with a --json error
   const dir = makeScratchDir();
   const pdfPaths = makePdfPaths(dir, "4");
   writeFileSync(pdfPaths.html, "<html></html>");
   const { spawnFn } = makeRouterSpawn({
-    "generate-pdf.mjs": { exitCode: 0 },
+    "generate-pdf.mjs": { exitCode: 0, writes: pdfPaths.finalPdf },
     "mark-pdf-ready.mjs": { exitCode: 2, stdout: JSON.stringify({ error: "No tracker row links report #4", code: "not-found" }) },
   });
   try {
@@ -355,7 +455,7 @@ test("renderAndMarkPdf: render succeeds but mark-pdf-ready fails with no parseab
   const pdfPaths = makePdfPaths(dir, "5");
   writeFileSync(pdfPaths.html, "<html></html>");
   const { spawnFn } = makeRouterSpawn({
-    "generate-pdf.mjs": { exitCode: 0 },
+    "generate-pdf.mjs": { exitCode: 0, writes: pdfPaths.finalPdf },
     "mark-pdf-ready.mjs": { exitCode: 1, stderr: "unexpected crash" },
   });
   try {
@@ -385,7 +485,7 @@ test("renderAndMarkPdf: successful render with stderr -> that stderr is surfaced
     "  - advisory phrase: world-class",
   ].join("\n");
   const { spawnFn } = makeRouterSpawn({
-    "generate-pdf.mjs": { exitCode: 0, stderr },
+    "generate-pdf.mjs": { exitCode: 0, stderr, writes: pdfPaths.finalPdf },
     "mark-pdf-ready.mjs": { exitCode: 0, stdout: JSON.stringify({ changed: true }) },
   });
   try {
@@ -410,7 +510,7 @@ test("renderAndMarkPdf: successful render with empty stderr -> no warnings inven
   const pdfPaths = makePdfPaths(dir, "7");
   writeFileSync(pdfPaths.html, "<html></html>");
   const { spawnFn } = makeRouterSpawn({
-    "generate-pdf.mjs": { exitCode: 0, stderr: "" },
+    "generate-pdf.mjs": { exitCode: 0, stderr: "", writes: pdfPaths.finalPdf },
     "mark-pdf-ready.mjs": { exitCode: 0, stdout: JSON.stringify({ changed: true }) },
   });
   try {

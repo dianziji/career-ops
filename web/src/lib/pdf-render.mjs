@@ -91,8 +91,29 @@ export function writeCvHtml({ pdfPaths, html }) {
 /**
  * The stderr line generate-pdf.mjs prints when a render ran over a warn-only
  * page budget and went to a sibling draft instead of the output path (#6377).
+ * Used only to NAME the draft in the error shown to the user; whether a PDF was
+ * delivered is decided from the file itself (see renderAndMarkPdf), never from
+ * this text, so a wording change or a decoding hiccup cannot mark a rejected
+ * render as ready.
  */
-export const OVERFLOW_DRAFT_RE = /^⚠️\s+Overflow draft: (.+?) \(/m;
+export const OVERFLOW_DRAFT_RE = /Overflow draft: (\S.*?) \(/m;
+
+/**
+ * Identity of the file at `file` as the renderer leaves it, or null when there
+ * is none. writeFileAtomic writes a temp file and renames it into place, so a
+ * delivered PDF always has a new inode and mtime; a render that kept the
+ * previous PDF (or wrote nothing) leaves this unchanged.
+ * @param {string} file
+ * @returns {string | null}
+ */
+export function pdfFingerprint(file) {
+  try {
+    const s = fs.statSync(file);
+    return `${s.ino}:${s.mtimeMs}:${s.size}`;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Spawn generate-pdf.mjs as a plain child process and resolve once it exits.
@@ -117,7 +138,11 @@ export function spawnGeneratePdf({ spawnFn, execPath, coreRoot, html, finalPdf, 
       },
     );
     let stderr = "";
-    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    // Decode on the stream, not per chunk: a chunk boundary inside a multibyte
+    // character (the warnings open with ⚠️) would otherwise leave U+FFFD in the
+    // text the error message is built from.
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (d) => { stderr += d; });
     child.on("close", (code) => resolve({ ok: code === 0, stderr: stderr.trim() }));
     child.on("error", (e) => resolve({ ok: false, stderr: `PDF rendering failed to start: ${e.message}` }));
   });
@@ -137,8 +162,10 @@ export function markTrackerReady({ spawnFn, execPath, coreRoot, reportNum }) {
     const child = spawnFn(execPath, [path.join(coreRoot, "mark-pdf-ready.mjs"), reportNum, "--json"], { cwd: coreRoot, windowsHide: true });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d) => { stdout += d.toString(); });
-    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
     child.on("close", (code) => {
       let data = null;
       try { data = JSON.parse(stdout); } catch { /* not JSON, or exited before printing any */ }
@@ -218,14 +245,19 @@ export function keepTailoredHtml(pdfPaths, warnings) {
 export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, format, reportNum }) {
   const warnings = [];
 
-  const render = await spawnGeneratePdf({ spawnFn, execPath, coreRoot, html: pdfPaths.html, finalPdf: pdfPaths.finalPdf, format, reportNum });
   // A render over a warn-only page budget exits 0 but writes nothing to the
-  // final path: the PDF went to a sibling .overflow.pdf draft, which
-  // generate-pdf.mjs names on one stderr line (#6377). This process sees only
-  // the exit code and stderr, so that line is the signal. There is no PDF to
-  // keep an HTML beside or to mark ready, and "done" would point the user at a
-  // file that was never written, so it is reported the way a strict overflow is.
-  const delivered = render.ok && !OVERFLOW_DRAFT_RE.test(render.stderr);
+  // final path: the PDF went to a sibling .overflow.pdf draft (#6377). There is
+  // then no PDF to keep an HTML beside or to mark ready, and "done" would point
+  // the user at a file that was never written, so it is reported the way a
+  // strict overflow is. Delivery is judged from the file: a PDF that landed at
+  // the final path during this render has a new identity, one that was kept or
+  // never written has the old one (or none). The stderr wording is not the
+  // signal, so a changed message or a split chunk cannot mark a rejected
+  // render as ready.
+  const before = pdfFingerprint(pdfPaths.finalPdf);
+  const render = await spawnGeneratePdf({ spawnFn, execPath, coreRoot, html: pdfPaths.html, finalPdf: pdfPaths.finalPdf, format, reportNum });
+  const after = pdfFingerprint(pdfPaths.finalPdf);
+  const delivered = render.ok && after !== null && after !== before;
   if (delivered) keepTailoredHtml(pdfPaths, warnings);
   cleanupPdfScratch(path.dirname(pdfPaths.html), `cv-web-${reportNum}.`);
 
@@ -235,12 +267,18 @@ export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, 
       // stderr opens with the page-budget warning, which alone runs past that
       // and reads as advice to keep going; the line saying no PDF was written
       // would never reach the user. Lead with the page counts and the outcome.
-      const budget = /CV is \d+ pages?; the allowed maximum is \d+ pages?\./.exec(render.stderr)?.[0] ?? "The CV is over its page budget.";
+      const budgetLine = /CV is \d+ pages?; the allowed maximum is \d+ pages?\./.exec(render.stderr)?.[0] ?? null;
       // The draft takes the first free name (.overflow.pdf, then .overflow-2.pdf,
       // ...), so name the one this render wrote, not the pattern: the user would
-      // otherwise open an older draft. The name comes from the same stderr line.
+      // otherwise open an older draft. The name comes from the stderr line.
       const draftPath = OVERFLOW_DRAFT_RE.exec(render.stderr)?.[1];
       const draftName = draftPath ? path.basename(draftPath) : null;
+      if (!budgetLine && !draftName) {
+        // Exit 0, no PDF, and nothing on stderr to explain it: say exactly that
+        // rather than guess at a page budget.
+        return { kind: "render-failed", error: `PDF rendering reported success but wrote nothing to ${path.basename(pdfPaths.finalPdf)}.` };
+      }
+      const budget = budgetLine ?? "The CV is over its page budget.";
       const named = draftName ? `${budget} No PDF was written; the over-budget draft is ${draftName}. Trim the CV and render again.` : null;
       const error = named && named.length <= 200
         ? named
