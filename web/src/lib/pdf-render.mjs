@@ -230,6 +230,14 @@ export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, 
   cleanupPdfScratch(path.dirname(pdfPaths.html), `cv-web-${reportNum}.`);
 
   if (!delivered) {
+    if (render.ok) {
+      // The route shows the first 200 characters of this error. The full
+      // stderr opens with the page-budget warning, which alone runs past that
+      // and reads as advice to keep going; the line saying no PDF was written
+      // would never reach the user. Lead with the page counts and the outcome.
+      const budget = /CV is \d+ pages?; the allowed maximum is \d+ pages?\./.exec(render.stderr)?.[0] ?? "The CV is over its page budget.";
+      return { kind: "render-failed", error: `${budget} No PDF was written: the over-budget render was kept as an .overflow.pdf draft beside it. Trim the CV and render again.` };
+    }
     return { kind: "render-failed", error: render.stderr || "PDF rendering failed." };
   }
 

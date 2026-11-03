@@ -306,12 +306,14 @@ test("renderAndMarkPdf: generate-pdf.mjs exits 0 over a warn-only page budget ->
     // When rendering
     const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "6" });
 
-    // Then it is reported like a failed render, with the page-budget message
-    // and the draft path, mark-pdf-ready is never invoked, and no HTML is kept
-    // beside a PDF that does not exist
+    // Then it is reported like a failed render. The route shows only the first
+    // 200 characters of the error, so the page counts and "no PDF was written"
+    // must fit there, ahead of any advice. mark-pdf-ready is never invoked, and
+    // no HTML is kept beside a PDF that does not exist
     assert.equal(result.kind, "render-failed");
-    assert.match(result.error, /CV is 2 pages/);
-    assert.match(result.error, /Overflow draft: /);
+    assert.match(result.error, /^CV is 2 pages; the allowed maximum is 1 page\./);
+    assert.match(result.error, /No PDF was written/);
+    assert.ok(result.error.length <= 200, `error must survive the route's 200-char cut, got ${result.error.length}`);
     assert.equal(calls.length, 1, "mark-pdf-ready.mjs must not run for a PDF that was never written");
     assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith("cv-web-6.")), []);
     assert.deepEqual(readdirSync(join(dir, "output")), [], "an overflow draft keeps no HTML");
