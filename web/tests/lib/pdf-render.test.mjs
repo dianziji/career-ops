@@ -287,6 +287,39 @@ test("renderAndMarkPdf: generate-pdf.mjs fails -> render-failed, mark-pdf-ready 
   }
 });
 
+test("renderAndMarkPdf: generate-pdf.mjs exits 0 over a warn-only page budget -> render-failed, nothing kept or marked", async () => {
+  // Given generate-pdf.mjs exits 0 but kept the render as a sibling draft
+  // because it ran over the page budget (#6377): it names the draft on stderr
+  // and wrote nothing to the final path, so there is no PDF to deliver.
+  const dir = makeScratchDir();
+  const pdfPaths = makePdfPaths(dir, "6");
+  writeFileSync(pdfPaths.html, "<html></html>");
+  const stderr = [
+    "⚠️  CV is 2 pages; the allowed maximum is 1 page. Trim lower-priority bullets, older roles, secondary projects, or the competencies strip, then regenerate. Overflow is warning-only by default; use --strict-pages to reject it.",
+    `⚠️  Overflow draft: ${pdfPaths.finalPdf.replace(/\.pdf$/, ".overflow.pdf")} (nothing was written to the output path). Trim and rerun to write ${pdfPaths.finalPdf}.`,
+  ].join("\n");
+  const { spawnFn, calls } = makeRouterSpawn({
+    "generate-pdf.mjs": { exitCode: 0, stderr },
+    "mark-pdf-ready.mjs": { exitCode: 0, stdout: JSON.stringify({ changed: true }) },
+  });
+  try {
+    // When rendering
+    const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "6" });
+
+    // Then it is reported like a failed render, with the page-budget message
+    // and the draft path, mark-pdf-ready is never invoked, and no HTML is kept
+    // beside a PDF that does not exist
+    assert.equal(result.kind, "render-failed");
+    assert.match(result.error, /CV is 2 pages/);
+    assert.match(result.error, /Overflow draft: /);
+    assert.equal(calls.length, 1, "mark-pdf-ready.mjs must not run for a PDF that was never written");
+    assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith("cv-web-6.")), []);
+    assert.deepEqual(readdirSync(join(dir, "output")), [], "an overflow draft keeps no HTML");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("renderAndMarkPdf: render succeeds but mark-pdf-ready fails with a parseable error -> rendered with a specific warning", async () => {
   // Given generate-pdf.mjs succeeds but mark-pdf-ready.mjs fails with a --json error
   const dir = makeScratchDir();

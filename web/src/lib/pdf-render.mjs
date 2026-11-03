@@ -89,6 +89,12 @@ export function writeCvHtml({ pdfPaths, html }) {
 }
 
 /**
+ * The stderr line generate-pdf.mjs prints when a render ran over a warn-only
+ * page budget and went to a sibling draft instead of the output path (#6377).
+ */
+export const OVERFLOW_DRAFT_RE = /^⚠️\s+Overflow draft: /m;
+
+/**
  * Spawn generate-pdf.mjs as a plain child process and resolve once it exits.
  * @param {{spawnFn: Function, execPath: string, coreRoot: string, html: string, finalPdf: string, format: "letter"|"a4", reportNum: string}} args
  * @returns {Promise<{ok: boolean, stderr: string}>}
@@ -213,20 +219,26 @@ export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, 
   const warnings = [];
 
   const render = await spawnGeneratePdf({ spawnFn, execPath, coreRoot, html: pdfPaths.html, finalPdf: pdfPaths.finalPdf, format, reportNum });
-  if (render.ok) keepTailoredHtml(pdfPaths, warnings);
+  // A render over a warn-only page budget exits 0 but writes nothing to the
+  // final path: the PDF went to a sibling .overflow.pdf draft, which
+  // generate-pdf.mjs names on one stderr line (#6377). This process sees only
+  // the exit code and stderr, so that line is the signal. There is no PDF to
+  // keep an HTML beside or to mark ready, and "done" would point the user at a
+  // file that was never written, so it is reported the way a strict overflow is.
+  const delivered = render.ok && !OVERFLOW_DRAFT_RE.test(render.stderr);
+  if (delivered) keepTailoredHtml(pdfPaths, warnings);
   cleanupPdfScratch(path.dirname(pdfPaths.html), `cv-web-${reportNum}.`);
 
-  if (!render.ok) {
+  if (!delivered) {
     return { kind: "render-failed", error: render.stderr || "PDF rendering failed." };
   }
 
-  // A render that exits 0 can still have written advisories to stderr, and two
-  // of them matter to whoever asked for this PDF: the page-budget overflow
-  // (warning-only unless --strict-pages) and the CV fact check's advisory
-  // phrases. Reading render.stderr only in the failure branch above collected
-  // both and dropped them, so on the web path an unsupported claim the fact
-  // gate flagged reached nobody. One warning per line, blank lines skipped, so
-  // a clean render still reports none.
+  // A render that exits 0 can still have written advisories to stderr, and
+  // they matter to whoever asked for this PDF: the CV fact check's advisory
+  // phrases, the portal-length warnings. Reading render.stderr only in the
+  // failure branch above collected them and dropped them, so on the web path
+  // an unsupported claim the fact gate flagged reached nobody. One warning per
+  // line, blank lines skipped, so a clean render still reports none.
   for (const line of render.stderr.split("\n")) {
     const text = line.trim();
     if (text) warnings.push(text);
