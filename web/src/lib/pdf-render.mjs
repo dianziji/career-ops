@@ -92,7 +92,7 @@ export function writeCvHtml({ pdfPaths, html }) {
  * The stderr line generate-pdf.mjs prints when a render ran over a warn-only
  * page budget and went to a sibling draft instead of the output path (#6377).
  */
-export const OVERFLOW_DRAFT_RE = /^⚠️\s+Overflow draft: /m;
+export const OVERFLOW_DRAFT_RE = /^⚠️\s+Overflow draft: (.+?) \(/m;
 
 /**
  * Spawn generate-pdf.mjs as a plain child process and resolve once it exits.
@@ -236,7 +236,16 @@ export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, 
       // and reads as advice to keep going; the line saying no PDF was written
       // would never reach the user. Lead with the page counts and the outcome.
       const budget = /CV is \d+ pages?; the allowed maximum is \d+ pages?\./.exec(render.stderr)?.[0] ?? "The CV is over its page budget.";
-      return { kind: "render-failed", error: `${budget} No PDF was written: the over-budget render was kept as an .overflow.pdf draft beside it. Trim the CV and render again.` };
+      // The draft takes the first free name (.overflow.pdf, then .overflow-2.pdf,
+      // ...), so name the one this render wrote, not the pattern: the user would
+      // otherwise open an older draft. The name comes from the same stderr line.
+      const draftPath = OVERFLOW_DRAFT_RE.exec(render.stderr)?.[1];
+      const draftName = draftPath ? path.basename(draftPath) : null;
+      const named = draftName ? `${budget} No PDF was written; the over-budget draft is ${draftName}. Trim the CV and render again.` : null;
+      const error = named && named.length <= 200
+        ? named
+        : `${budget} No PDF was written: the over-budget render was kept as an .overflow.pdf draft beside it. Trim the CV and render again.`;
+      return { kind: "render-failed", error };
     }
     return { kind: "render-failed", error: render.stderr || "PDF rendering failed." };
   }

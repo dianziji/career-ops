@@ -294,9 +294,12 @@ test("renderAndMarkPdf: generate-pdf.mjs exits 0 over a warn-only page budget ->
   const dir = makeScratchDir();
   const pdfPaths = makePdfPaths(dir, "6");
   writeFileSync(pdfPaths.html, "<html></html>");
+  // A second overflow takes the next free name, so the error must name the
+  // draft this render wrote, not the ".overflow.pdf" pattern.
+  const draftPath = pdfPaths.finalPdf.replace(/\.pdf$/, ".overflow-2.pdf");
   const stderr = [
     "⚠️  CV is 2 pages; the allowed maximum is 1 page. Trim lower-priority bullets, older roles, secondary projects, or the competencies strip, then regenerate. Overflow is warning-only by default; use --strict-pages to reject it.",
-    `⚠️  Overflow draft: ${pdfPaths.finalPdf.replace(/\.pdf$/, ".overflow.pdf")} (nothing was written to the output path). Trim and rerun to write ${pdfPaths.finalPdf}.`,
+    `⚠️  Overflow draft: ${draftPath} (nothing was written to the output path). Trim and rerun to write ${pdfPaths.finalPdf}.`,
   ].join("\n");
   const { spawnFn, calls } = makeRouterSpawn({
     "generate-pdf.mjs": { exitCode: 0, stderr },
@@ -313,6 +316,8 @@ test("renderAndMarkPdf: generate-pdf.mjs exits 0 over a warn-only page budget ->
     assert.equal(result.kind, "render-failed");
     assert.match(result.error, /^CV is 2 pages; the allowed maximum is 1 page\./);
     assert.match(result.error, /No PDF was written/);
+    assert.ok(result.error.includes("cv-jane-acme-2026-07-26.overflow-2.pdf"), `error must name the draft this render wrote, got: ${result.error}`);
+    assert.ok(!result.error.includes(dir), "the error names the file, not the full path");
     assert.ok(result.error.length <= 200, `error must survive the route's 200-char cut, got ${result.error.length}`);
     assert.equal(calls.length, 1, "mark-pdf-ready.mjs must not run for a PDF that was never written");
     assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith("cv-web-6.")), []);
