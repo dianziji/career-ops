@@ -83,8 +83,9 @@ test("spawnGeneratePdf: clean exit -> ok:true, invokes generate-pdf.mjs with --a
   // When spawning the render
   const result = await spawnGeneratePdf({ spawnFn, execPath: "node", coreRoot: "/root", html: "/root/x.html", finalPdf: "/root/output/x.pdf", format: "letter", reportNum: "018" });
 
-  // Then it reports ok:true and invoked generate-pdf.mjs with the expected args
-  assert.deepEqual(result, { ok: true, stderr: "" });
+  // Then it reports ok:true (nothing landed at the final path, so not
+  // delivered) and invoked generate-pdf.mjs with the expected args
+  assert.deepEqual(result, { ok: true, delivered: false, stderr: "" });
   assert.equal(calls.length, 1);
   assert.match(calls[0].args[0], /generate-pdf\.mjs$/);
   assert.deepEqual(calls[0].args.slice(1), ["/root/x.html", "/root/output/x.pdf", "--format=letter", "--report=018", "--allow-reorder"]);
@@ -102,7 +103,7 @@ test("spawnGeneratePdf: non-zero exit -> ok:false, stderr surfaced", async () =>
   const result = await spawnGeneratePdf({ spawnFn, execPath: "node", coreRoot: "/root", html: "x.html", finalPdf: "x.pdf", format: "a4", reportNum: "1" });
 
   // Then it reports ok:false with that stderr
-  assert.deepEqual(result, { ok: false, stderr: "section order guard failed" });
+  assert.deepEqual(result, { ok: false, delivered: false, stderr: "section order guard failed" });
 });
 
 test("spawnGeneratePdf: spawn error -> ok:false, descriptive stderr", async () => {
@@ -114,7 +115,29 @@ test("spawnGeneratePdf: spawn error -> ok:false, descriptive stderr", async () =
 
   // Then it reports ok:false with a descriptive message, not a raw crash
   assert.equal(result.ok, false);
+  assert.equal(result.delivered, false);
   assert.match(result.stderr, /PDF rendering failed to start: ENOENT/);
+});
+
+test("spawnGeneratePdf: delivered is the PDF landing at the final path, not the exit code", async () => {
+  // Given a final path with and without a previous PDF, and renders that do
+  // or do not write there (#6377): a warn-only overflow exits 0 and leaves the
+  // path as it was, a delivered render always puts a new file there.
+  const dir = makeScratchDir();
+  const finalPdf = join(dir, "x.pdf");
+  const run = (route) => spawnGeneratePdf({ spawnFn: () => fakeChild(route), execPath: "node", coreRoot: "/root", html: join(dir, "x.html"), finalPdf, format: "letter", reportNum: "1" });
+  try {
+    // When the render writes the PDF where none was
+    assert.equal((await run({ exitCode: 0, writes: finalPdf })).delivered, true, "a new PDF is delivered");
+    // When a later render exits 0 and keeps the previous PDF in place
+    assert.equal((await run({ exitCode: 0 })).delivered, false, "a kept previous PDF is not this render's");
+    // When the render replaces the previous PDF
+    assert.equal((await run({ exitCode: 0, writes: finalPdf })).delivered, true, "a replaced PDF is delivered");
+    // When the render fails after writing (a non-zero exit never delivers)
+    assert.equal((await run({ exitCode: 1, writes: finalPdf })).delivered, false, "a failed exit is never delivered");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── markTrackerReady ──
@@ -405,6 +428,30 @@ test("renderAndMarkPdf: a stderr chunk boundary inside a multibyte character sti
     assert.equal(calls.length, 1, "mark-pdf-ready.mjs must not run");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("renderAndMarkPdf: a ' (' inside a directory on the draft's path does not truncate the draft's name", async () => {
+  // Given a data root like "Job (2026)": the draft line reads
+  // "Overflow draft: /…/Job (2026)/output/cv….overflow.pdf (nothing was …",
+  // and a capture that stopped at the first " (" would name the directory.
+  const dir = join(makeScratchDir(), "Job (2026)");
+  mkdirSync(join(dir, "output"), { recursive: true });
+  const pdfPaths = makePdfPaths(dir, "11");
+  writeFileSync(pdfPaths.html, "<html></html>");
+  const draftPath = pdfPaths.finalPdf.replace(/\.pdf$/, ".overflow.pdf");
+  const stderr = `⚠️  CV is 2 pages; the allowed maximum is 1 page. Trim it.\n⚠️  Overflow draft: ${draftPath} (nothing was written to the output path). Trim and rerun to write ${pdfPaths.finalPdf}.`;
+  const { spawnFn } = makeRouterSpawn({
+    "generate-pdf.mjs": { exitCode: 0, stderr },
+    "mark-pdf-ready.mjs": { exitCode: 0, stdout: "{}" },
+  });
+  try {
+    const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "11" });
+
+    assert.equal(result.kind, "render-failed");
+    assert.ok(result.error.includes("the over-budget draft is cv-jane-acme-2026-07-26.overflow.pdf"), result.error);
+  } finally {
+    rmSync(join(dir, ".."), { recursive: true, force: true });
   }
 });
 

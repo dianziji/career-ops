@@ -2595,15 +2595,14 @@ async function renderInPage(browser, html, outputPath, opts = {}) {
     if (pageCount > budget.maxPages) {
       const hadPrevious = existsSync(outputPath);
       const draftPath = writeOverflowDraft(outputPath, pdfBuffer);
-      if (budget.strictPages) {
-        try {
-          enforcePageBudget(pageCount, budget);
-        } catch (err) {
-          err.message += ` Rejected draft: ${draftPath} (${hadPrevious ? 'the existing PDF was left unchanged' : 'nothing was written to the output path'}).`;
-          throw err;
-        }
+      // Strict throws here, naming the draft; warn-only prints the budget
+      // warning and carries on to name it below.
+      try {
+        enforcePageBudget(pageCount, budget);
+      } catch (err) {
+        err.message += ` Rejected draft: ${draftPath} (${hadPrevious ? 'the existing PDF was left unchanged' : 'nothing was written to the output path'}).`;
+        throw err;
       }
-      enforcePageBudget(pageCount, budget);
       // One line a caller can read back: the web layer treats this render as
       // not delivered, since it only sees the exit code and stderr.
       console.warn(`⚠️  Overflow draft: ${draftPath} (${hadPrevious ? 'the existing PDF at the output path was left unchanged' : 'nothing was written to the output path'}). Trim and rerun to write ${outputPath}.`);
