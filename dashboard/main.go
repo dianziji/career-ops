@@ -353,7 +353,10 @@ func runGeneratePDF(msg screens.PipelineGeneratePDFMsg) tea.Cmd {
 		if err != nil {
 			return screens.PipelinePDFGeneratedMsg{Err: summarizeCmdError(err, out)}
 		}
-		if after, err := os.Stat(pdfAbs); err != nil || !pdfWrittenBetween(before, after) {
+		// The render's own overflow line outranks a changed file: a PDF another
+		// render landed at this path meanwhile is not this render's result.
+		after, _ := os.Stat(pdfAbs)
+		if reOverflowDraftLine.Match(out) || !pdfWrittenBetween(before, after) {
 			return screens.PipelinePDFGeneratedMsg{Err: summarizeUndelivered(out, pdfAbs)}
 		}
 		if err := openWithDefaultApp(pdfAbs); err != nil {
@@ -365,8 +368,10 @@ func runGeneratePDF(msg screens.PipelineGeneratePDFMsg) tea.Cmd {
 
 // pdfWrittenBetween reports whether the PDF at the path is a file the render
 // left there: generate-pdf.mjs writes a temp file and renames it into place,
-// so a delivered PDF has a new modification time (and usually a new size),
-// while a kept previous PDF has the old one.
+// so a delivered PDF is a different file (and has a new modification time and
+// usually a new size), while a kept previous PDF is the same file as before.
+// The identity check covers a filesystem whose timestamps are too coarse to
+// tell a same-sized rerender apart.
 func pdfWrittenBetween(before, after fs.FileInfo) bool {
 	if after == nil {
 		return false
@@ -374,7 +379,7 @@ func pdfWrittenBetween(before, after fs.FileInfo) bool {
 	if before == nil {
 		return true
 	}
-	return !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size()
+	return !os.SameFile(before, after) || !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size()
 }
 
 // reOverflowDraftLine finds the draft generate-pdf.mjs names when a render

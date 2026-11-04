@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/santifer/career-ops/dashboard/internal/ui/screens"
 )
@@ -46,6 +47,11 @@ func init() {
 				_ = os.WriteFile(draft, []byte("%PDF draft"), 0o644)
 				os.Stderr.WriteString("⚠️  CV is 2 pages; the allowed maximum is 1 page. Trim lower-priority bullets, older roles, secondary projects, or the competencies strip, then regenerate. Overflow is warning-only by default; use --strict-pages to reject it.\n")
 				os.Stderr.WriteString("⚠️  Overflow draft: " + draft + " (nothing was written to the output path). Trim and rerun to write " + pdfPath + ".\n")
+				// Another render landing its PDF at the path while this one
+				// ran over budget.
+				if os.Getenv("CAREER_OPS_TEST_PDF_LANDED_MEANWHILE") == "1" {
+					_ = os.WriteFile(pdfPath, []byte("%PDF from another render"), 0o644)
+				}
 			} else {
 				_ = os.WriteFile(pdfPath, []byte("%PDF"), 0o644)
 			}
@@ -123,6 +129,50 @@ func TestRunGeneratePDFOverflowWithNoPDFIsNotGenerated(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "output", "cv-acme.pdf")); err == nil {
 		t.Fatal("no PDF must appear at the output path")
+	}
+}
+
+func TestRunGeneratePDFOverflowOutranksAPDFLandedMeanwhile(t *testing.T) {
+	// This render wrote a draft; a PDF another render put at the path in the
+	// meantime is a changed file, but not this render's result.
+	root := t.TempDir()
+	opened := fakeNode(t)
+	t.Setenv("CAREER_OPS_TEST_PDF_OVERFLOW", "1")
+	t.Setenv("CAREER_OPS_TEST_PDF_LANDED_MEANWHILE", "1")
+	msg := runGeneratePDF(screens.PipelineGeneratePDFMsg{CareerOpsPath: root, HTMLPath: "output/cv-acme.html", PDFPath: "output/cv-acme.pdf", ReportNumber: "007"})().(screens.PipelinePDFGeneratedMsg)
+	if msg.Path != "" || *opened != "" {
+		t.Fatalf("another render's PDF must not be opened as this one's: %+v (opened %q)", msg, *opened)
+	}
+	if !strings.Contains(msg.Err, "No PDF was written; the over-budget draft is cv-acme.overflow.pdf.") {
+		t.Fatalf("got %q", msg.Err)
+	}
+}
+
+func TestPDFWrittenBetweenSeesAReplacementByIdentity(t *testing.T) {
+	// A rerender of the same size inside one timestamp tick is still a new
+	// file: generate-pdf.mjs renames a temp file into place.
+	dir := t.TempDir()
+	first := filepath.Join(dir, "a.pdf")
+	second := filepath.Join(dir, "b.pdf")
+	for _, name := range []string{first, second} {
+		if err := os.WriteFile(name, []byte("%PDF same size"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stamp := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	for _, name := range []string{first, second} {
+		if err := os.Chtimes(name, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _ := os.Stat(first)
+	after, _ := os.Stat(second)
+	if !pdfWrittenBetween(before, after) {
+		t.Fatal("a different file with equal size and mtime is a replacement")
+	}
+	again, _ := os.Stat(first)
+	if pdfWrittenBetween(before, again) {
+		t.Fatal("the same untouched file is not a delivery")
 	}
 }
 
