@@ -431,6 +431,33 @@ test("renderAndMarkPdf: a stderr chunk boundary inside a multibyte character sti
   }
 });
 
+test("renderAndMarkPdf: another render's PDF landing at the final path does not make this render's overflow draft delivered", async () => {
+  // Given two renders of the same report in flight (unsupported, but
+  // possible: the run registry counts runs, it does not lock paths). The other
+  // one writes a PDF to the final path while this one runs over the budget
+  // and writes only a draft. The file changed, but this render said it
+  // delivered nothing, and its word wins.
+  const dir = makeScratchDir();
+  const pdfPaths = makePdfPaths(dir, "12");
+  writeFileSync(pdfPaths.html, "<html></html>");
+  const draftPath = pdfPaths.finalPdf.replace(/\.pdf$/, ".overflow.pdf");
+  const stderr = `⚠️  CV is 2 pages; the allowed maximum is 1 page. Trim it.\n⚠️  Overflow draft: ${draftPath} (nothing was written to the output path). Trim and rerun to write ${pdfPaths.finalPdf}.`;
+  const { spawnFn, calls } = makeRouterSpawn({
+    "generate-pdf.mjs": { exitCode: 0, stderr, writes: pdfPaths.finalPdf },
+    "mark-pdf-ready.mjs": { exitCode: 0, stdout: "{}" },
+  });
+  try {
+    const result = await renderAndMarkPdf({ spawnFn, execPath: "node", coreRoot: "/root", pdfPaths, format: "letter", reportNum: "12" });
+
+    assert.equal(result.kind, "render-failed");
+    assert.match(result.error, /No PDF was written; the over-budget draft is cv-jane-acme-2026-07-26\.overflow\.pdf/);
+    assert.equal(calls.length, 1, "mark-pdf-ready.mjs must not run");
+    assert.deepEqual(readdirSync(join(dir, "output")).filter((f) => f.endsWith(".html")), [], "no HTML is kept beside the other render's PDF");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("renderAndMarkPdf: a ' (' inside a directory on the draft's path does not truncate the draft's name", async () => {
   // Given a data root like "Job (2026)": the draft line reads
   // "Overflow draft: /…/Job (2026)/output/cv….overflow.pdf (nothing was …",

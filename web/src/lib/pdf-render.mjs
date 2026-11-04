@@ -125,8 +125,10 @@ export function pdfFingerprint(file) {
  * would keep an HTML beside, and mark the tracker ready for, a file that was
  * never written. Delivery is judged from the file: a PDF that landed during
  * this render has a new identity, one that was kept or never written has the
- * old one (or none). Every caller reads `delivered`, so the judgement lives
- * here and not in one of them.
+ * old one (or none). The render's own word outranks the file: when it says it
+ * wrote an overflow draft, a PDF that another render of the same path landed
+ * meanwhile is not this one's, however new it looks. Every caller reads
+ * `delivered`, so the judgement lives here and not in one of them.
  * @param {{spawnFn: Function, execPath: string, coreRoot: string, html: string, finalPdf: string, format: "letter"|"a4", reportNum: string}} args
  * @returns {Promise<{ok: boolean, delivered: boolean, stderr: string}>}
  */
@@ -157,7 +159,8 @@ export function spawnGeneratePdf({ spawnFn, execPath, coreRoot, html, finalPdf, 
     child.on("close", (code) => {
       const ok = code === 0;
       const after = pdfFingerprint(finalPdf);
-      resolve({ ok, delivered: ok && after !== null && after !== before, stderr: stderr.trim() });
+      const landed = after !== null && after !== before;
+      resolve({ ok, delivered: ok && landed && !OVERFLOW_DRAFT_RE.test(stderr), stderr: stderr.trim() });
     });
     child.on("error", (e) => resolve({ ok: false, delivered: false, stderr: `PDF rendering failed to start: ${e.message}` }));
   });
