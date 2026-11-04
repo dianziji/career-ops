@@ -15,7 +15,6 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 
 /**
  * @typedef {Object} PdfRunSignals
@@ -90,39 +89,27 @@ export function writeCvHtml({ pdfPaths, html }) {
 }
 
 /**
- * Where generate-pdf.mjs reports what a render produced (`--result=`): beside
- * the scratch HTML, under the same `cv-web-{report}.` prefix the scratch sweep
- * removes, with a name of its own per call. The file is this process's own
- * account of its render — written only once a render returned, with
- * `draftPath` set when the PDF went to an overflow draft instead of the output
- * path (#6377) — so a caller never has to read console output or guess from
- * the file system, where another run's PDF at the same path would be mistaken
- * for this one's. The per-call name closes the same hole one level up: two
- * renders of one report share the final path, and a result keyed per report
- * would let one run read the other's.
- * @param {{html: string}} pdfPaths
- * @returns {string}
+ * The stderr line generate-pdf.mjs prints when a render ran over a warn-only
+ * page budget and went to a sibling draft instead of the output path (#6377).
+ * Used only to NAME the draft in the error shown to the user; whether a PDF was
+ * delivered is decided from the file itself (see renderAndMarkPdf), never from
+ * this text, so a wording change or a decoding hiccup cannot mark a rejected
+ * render as ready.
  */
-export function renderResultPath(pdfPaths) {
-  return pdfPaths.html.replace(/\.html$/i, `.${randomUUID()}.result.json`);
-}
+export const OVERFLOW_DRAFT_RE = /Overflow draft: (\S.*?) \(/m;
 
 /**
- * Read the render result generate-pdf.mjs wrote, or null when there is none or
- * it does not have a result's shape (so a partial or foreign file reads as
- * "not delivered" rather than crashing the route).
+ * Identity of the file at `file` as the renderer leaves it, or null when there
+ * is none. writeFileAtomic writes a temp file and renames it into place, so a
+ * delivered PDF always has a new inode and mtime; a render that kept the
+ * previous PDF (or wrote nothing) leaves this unchanged.
  * @param {string} file
- * @returns {{outputPath: string, pageCount: number, size: number, draftPath?: string} | null}
+ * @returns {string | null}
  */
-export function readRenderResult(file) {
+export function pdfFingerprint(file) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
-    if (typeof parsed.outputPath !== "string" || !parsed.outputPath) return null;
-    if (!Number.isInteger(parsed.pageCount) || parsed.pageCount < 1) return null;
-    if (typeof parsed.size !== "number") return null;
-    if (parsed.draftPath !== undefined && (typeof parsed.draftPath !== "string" || !parsed.draftPath)) return null;
-    return parsed;
+    const s = fs.statSync(file);
+    return `${s.ino}:${s.mtimeMs}:${s.size}`;
   } catch {
     return null;
   }
@@ -130,10 +117,10 @@ export function readRenderResult(file) {
 
 /**
  * Spawn generate-pdf.mjs as a plain child process and resolve once it exits.
- * @param {{spawnFn: Function, execPath: string, coreRoot: string, html: string, finalPdf: string, format: "letter"|"a4", reportNum: string, resultPath?: string}} args
+ * @param {{spawnFn: Function, execPath: string, coreRoot: string, html: string, finalPdf: string, format: "letter"|"a4", reportNum: string}} args
  * @returns {Promise<{ok: boolean, stderr: string}>}
  */
-export function spawnGeneratePdf({ spawnFn, execPath, coreRoot, html, finalPdf, format, reportNum, resultPath }) {
+export function spawnGeneratePdf({ spawnFn, execPath, coreRoot, html, finalPdf, format, reportNum }) {
   return new Promise((resolve) => {
     const child = spawnFn(
       execPath,
@@ -141,10 +128,7 @@ export function spawnGeneratePdf({ spawnFn, execPath, coreRoot, html, finalPdf, 
       // from the template's fixed markup order, so this guard would otherwise
       // hard-fail every web-triggered render — same bypass a human already
       // applies manually via the CLI when this diverges.
-      [
-        path.join(coreRoot, "generate-pdf.mjs"), html, finalPdf, `--format=${format}`, `--report=${reportNum}`, "--allow-reorder",
-        ...(resultPath ? [`--result=${resultPath}`] : []),
-      ],
+      [path.join(coreRoot, "generate-pdf.mjs"), html, finalPdf, `--format=${format}`, `--report=${reportNum}`, "--allow-reorder"],
       // windowsHide: see api/doctor/route.ts — a stale inherited console
       // kills every child with 0xC0000142 on Windows; never inherit one.
       {
@@ -265,39 +249,43 @@ export async function renderAndMarkPdf({ spawnFn, execPath, coreRoot, pdfPaths, 
   // final path: the PDF went to a sibling .overflow.pdf draft (#6377). There is
   // then no PDF to keep an HTML beside or to mark ready, and "done" would point
   // the user at a file that was never written, so it is reported the way a
-  // strict overflow is. Whether a PDF was delivered comes from the result file
-  // the render process writes about itself (see renderResultPath): not from
-  // its console wording, which can change or arrive split, and not from the
-  // final path's mtime, which another run for the same report could have
-  // changed. The path is this call's own, so no earlier or concurrent run's
-  // result can stand in for it; generate-pdf.mjs clears anything there anyway.
-  const resultPath = renderResultPath(pdfPaths);
-  const render = await spawnGeneratePdf({ spawnFn, execPath, coreRoot, html: pdfPaths.html, finalPdf: pdfPaths.finalPdf, format, reportNum, resultPath });
-  const result = render.ok ? readRenderResult(resultPath) : null;
-  const delivered = result !== null && !result.draftPath;
+  // strict overflow is. Delivery is judged from the file: a PDF that landed at
+  // the final path during this render has a new identity, one that was kept or
+  // never written has the old one (or none). The stderr wording is not the
+  // signal, so a changed message or a split chunk cannot mark a rejected
+  // render as ready.
+  const before = pdfFingerprint(pdfPaths.finalPdf);
+  const render = await spawnGeneratePdf({ spawnFn, execPath, coreRoot, html: pdfPaths.html, finalPdf: pdfPaths.finalPdf, format, reportNum });
+  const after = pdfFingerprint(pdfPaths.finalPdf);
+  const delivered = render.ok && after !== null && after !== before;
   if (delivered) keepTailoredHtml(pdfPaths, warnings);
   cleanupPdfScratch(path.dirname(pdfPaths.html), `cv-web-${reportNum}.`);
 
   if (!delivered) {
-    if (!render.ok) {
-      return { kind: "render-failed", error: render.stderr || "PDF rendering failed." };
+    if (render.ok) {
+      // The route shows the first 200 characters of this error. The full
+      // stderr opens with the page-budget warning, which alone runs past that
+      // and reads as advice to keep going; the line saying no PDF was written
+      // would never reach the user. Lead with the page counts and the outcome.
+      const budgetLine = /CV is \d+ pages?; the allowed maximum is \d+ pages?\./.exec(render.stderr)?.[0] ?? null;
+      // The draft takes the first free name (.overflow.pdf, then .overflow-2.pdf,
+      // ...), so name the one this render wrote, not the pattern: the user would
+      // otherwise open an older draft. The name comes from the stderr line.
+      const draftPath = OVERFLOW_DRAFT_RE.exec(render.stderr)?.[1];
+      const draftName = draftPath ? path.basename(draftPath) : null;
+      if (!budgetLine && !draftName) {
+        // Exit 0, no PDF, and nothing on stderr to explain it: say exactly that
+        // rather than guess at a page budget.
+        return { kind: "render-failed", error: `PDF rendering reported success but wrote nothing to ${path.basename(pdfPaths.finalPdf)}.` };
+      }
+      const budget = budgetLine ?? "The CV is over its page budget.";
+      const named = draftName ? `${budget} No PDF was written; the over-budget draft is ${draftName}. Trim the CV and render again.` : null;
+      const error = named && named.length <= 200
+        ? named
+        : `${budget} No PDF was written: the over-budget render was kept as an .overflow.pdf draft beside it. Trim the CV and render again.`;
+      return { kind: "render-failed", error };
     }
-    if (result === null) {
-      // Exit 0 but no account of a render: say exactly that rather than guess.
-      return { kind: "render-failed", error: `PDF rendering reported success but left no usable result for ${path.basename(pdfPaths.finalPdf)}.` };
-    }
-    // The route shows the first 200 characters of this error. The full stderr
-    // opens with the page-budget warning, which alone runs past that and reads
-    // as advice to keep going; lead with the page counts and the outcome, and
-    // name the draft this render wrote (the first free name, so a second
-    // overflow is .overflow-2.pdf and the user must not open the older one).
-    const budget = /CV is \d+ pages?; the allowed maximum is \d+ pages?\./.exec(render.stderr)?.[0]
-      ?? `The CV is ${result.pageCount} pages, over its page budget.`;
-    const named = `${budget} No PDF was written; the over-budget draft is ${path.basename(result.draftPath)}. Trim the CV and render again.`;
-    const error = named.length <= 200
-      ? named
-      : `${budget} No PDF was written: the over-budget render was kept as an .overflow.pdf draft beside it. Trim the CV and render again.`;
-    return { kind: "render-failed", error };
+    return { kind: "render-failed", error: render.stderr || "PDF rendering failed." };
   }
 
   // A render that exits 0 can still have written advisories to stderr, and

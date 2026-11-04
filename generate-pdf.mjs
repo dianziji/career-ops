@@ -4,17 +4,8 @@
  * generate-pdf.mjs — HTML → PDF via Playwright
  *
  * Usage:
- *   node career-ops/generate-pdf.mjs <input.html> <output.pdf> [--format=letter|a4] [--country=XX] [--report=NNN] [--kind=cv|cover] [--allow-reorder] [--allow-nonchronological] [--max-pages=N] [--strict-pages] [--skip-fact-check] [--result=<result.json>]
+ *   node career-ops/generate-pdf.mjs <input.html> <output.pdf> [--format=letter|a4] [--country=XX] [--report=NNN] [--kind=cv|cover] [--allow-reorder] [--allow-nonchronological] [--max-pages=N] [--strict-pages] [--skip-fact-check]
  *   node career-ops/generate-pdf.mjs --batch=<manifest.json> [--format=letter|a4] [--country=XX] [--allow-reorder] [--allow-nonchronological] [--max-pages=N] [--strict-pages] [--skip-fact-check]
- *
- * --result=<path> writes what a single render produced as JSON, the same
- * {outputPath, pageCount, size, draftPath?} renderHtmlToPdf() returns, so a
- * caller that spawns this script (the web UI) learns from the process itself
- * whether the PDF landed at the output path or went to an overflow draft,
- * instead of reading the console output or guessing from the file system.
- * Nothing is written there when the render fails, and a stale file at that
- * path is removed before rendering starts. Batch mode has its own
- * <manifest>.results.json and does not take this flag.
  *
  * --batch renders every document in a JSON manifest (an array of
  * {input, output, format?, reportNum?}) through ONE shared Chromium instead of
@@ -61,7 +52,7 @@
 
 import { resolve, dirname, relative, sep, isAbsolute, basename } from 'path';
 import { readFile } from 'fs/promises';
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { randomUUID } from 'node:crypto';
 import { getCareerOpsRoot, getProfilePath, hasProfileOverride } from './path-resolver.mjs';
@@ -1794,15 +1785,9 @@ async function generatePDF() {
   // lib/page-format.mjs, which ranks it below the user's config/profile.yml.
   let inputPath, outputPath, format = null, country = null, reportNum = '', allowReorder = false, allowNonChronological = false;
   let maxPages = 2, maxPagesInput = '2', maxPagesSupplied = false, strictPages = false, batchManifestPath = null;
-  // null: no flag. '' : the flag with no operand, rejected below like --report.
-  let resultPath = null;
 
   for (const arg of args) {
-    if (arg.startsWith('--result=')) {
-      resultPath = arg.slice('--result='.length).trim();
-    } else if (arg === '--result') {
-      resultPath = '';
-    } else if (arg.startsWith('--format=')) {
+    if (arg.startsWith('--format=')) {
       format = arg.split('=')[1].toLowerCase();
     } else if (arg.startsWith('--country=')) {
       country = arg.slice('--country='.length);
@@ -1875,15 +1860,6 @@ async function generatePDF() {
 
   if (kindSupplied && (!kindFlag || !resolveArtifactKind(kindFlag).kind)) {
     console.error(`Invalid --kind "${kindFlag}". Use: ${ARTIFACT_KINDS.join(', ')}`);
-    process.exit(1);
-  }
-
-  if (resultPath === '') {
-    console.error('Invalid --result "". Use a file path, e.g. --result=output/render.result.json.');
-    process.exit(1);
-  }
-  if (resultPath !== null && batchManifestPath) {
-    console.error('--result applies to a single render; a batch writes <manifest>.results.json instead.');
     process.exit(1);
   }
 
@@ -2005,33 +1981,6 @@ async function generatePDF() {
     console.error(`Refusing to write the PDF outside the tracker workspace: ${outputPath}`);
     process.exit(1);
   }
-  if (resultPath !== null) {
-    resultPath = resolvePdfCliPath(resultPath);
-    // Same containment as the PDF: the caller names where this file goes.
-    if (!isWorkspaceOutputPath(resultPath, workspaceRoot)) {
-      console.error(`Refusing to write the render result outside the tracker workspace: ${resultPath}`);
-      process.exit(1);
-    }
-    // A result left by an earlier run at the same path must never be read as
-    // this run's: a failed render here writes nothing, and the caller reads
-    // "nothing" as "not delivered". The directory is created now, before any
-    // rendering, so the one write that can still fail after the PDF exists is
-    // the write itself.
-    try {
-      unlinkSync(resultPath);
-    } catch (err) {
-      if (err?.code !== 'ENOENT') {
-        console.error(`Could not clear the previous render result at ${resultPath}: ${err.message}`);
-        process.exit(1);
-      }
-    }
-    try {
-      mkdirSync(dirname(resultPath), { recursive: true });
-    } catch (err) {
-      console.error(`Could not create the directory for the render result ${resultPath}: ${err.message}`);
-      process.exit(1);
-    }
-  }
 
   console.log(`📄 Input:  ${inputPath}`);
   console.log(`📁 Output: ${outputPath}`);
@@ -2092,7 +2041,7 @@ async function generatePDF() {
     else warnFactGateNotRun();
   }
 
-  const result = await renderHtmlToPdf(html, outputPath, {
+  return renderHtmlToPdf(html, outputPath, {
     format,
     baseDir: dirname(inputPath),
     reportNum,
@@ -2102,20 +2051,6 @@ async function generatePDF() {
     strictPages: budget.strictPages,
     styleTokens: readStyleTokens(workspaceProfilePath()),
   });
-  if (resultPath !== null) {
-    // Written only once the render returned, so the file's existence alone
-    // means "this process finished a render", and its draftPath says whether
-    // the PDF went to the output path or to an overflow draft (#6377).
-    try {
-      writeFileAtomic(resultPath, JSON.stringify(result, null, 2) + '\n');
-    } catch (err) {
-      // The render itself is done; say so, since the caller will read the
-      // missing result as "not delivered" and should know the PDF exists.
-      throw new Error(`Rendered ${result.draftPath ?? result.outputPath}, but the render result could not be written to ${resultPath}: ${err.message}`);
-    }
-    console.log(`🧾 Result: ${resultPath}`);
-  }
-  return result;
 }
 
 /**
